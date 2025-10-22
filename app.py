@@ -1,7 +1,6 @@
 import streamlit as st
 import pandas as pd
 import io
-import base64
 from datetime import datetime, time
 
 # ===== CONFIGURACIÓN =====
@@ -36,7 +35,6 @@ def procesar_3m_aire(archivos):
     
     for i, archivo in enumerate(archivos, 1):
         try:
-            # Leer archivo .xls
             df = pd.read_excel(archivo, header=2, engine='xlrd')
             df.columns = [str(col).strip() for col in df.columns]
             
@@ -49,6 +47,45 @@ def procesar_3m_aire(archivos):
                 }
         except Exception as e:
             st.error(f"Error procesando {archivo.name}: {str(e)}")
+    
+    return resultados
+
+def procesar_airthinx(archivo, tiempos_airthinx):
+    """Procesa archivo Airthinx con configuración de tiempos"""
+    resultados = {}
+    
+    try:
+        df = pd.read_excel(archivo, header=0, engine='openpyxl')
+        
+        # Convertir columna de timestamp
+        df['Timestamp'] = pd.to_datetime(df['Timestamp'])
+        
+        for punto, (inicio, fin) in tiempos_airthinx.items():
+            # Combinar fecha del archivo con tiempos configurados
+            fecha_base = df['Timestamp'].iloc[0].date()
+            inicio_dt = datetime.combine(fecha_base, inicio)
+            fin_dt = datetime.combine(fecha_base, fin)
+            
+            # Filtrar por rango
+            mask = (df['Timestamp'] >= inicio_dt) & (df['Timestamp'] <= fin_dt)
+            datos_punto = df[mask]
+            
+            if not datos_punto.empty:
+                resultados[punto] = {
+                    'CO2 (ppm)': [
+                        safe_min(datos_punto.iloc[:, 1]),
+                        safe_mean(datos_punto.iloc[:, 1]), 
+                        safe_max(datos_punto.iloc[:, 1])
+                    ],
+                    'COV (mg/m³)': [
+                        safe_min(datos_punto.iloc[:, 2]),
+                        safe_mean(datos_punto.iloc[:, 2]),
+                        safe_max(datos_punto.iloc[:, 2])
+                    ]
+                }
+                
+    except Exception as e:
+        st.error(f"Error procesando Airthinx: {str(e)}")
     
     return resultados
 
@@ -71,11 +108,43 @@ def procesar_ruido_3m(archivos):
     
     return resultados
 
-def generar_excel_consolidado(datos_aire, datos_ruido, nombre_empresa):
-    """Genera Excel usando solo pandas (sin openpyxl)"""
+def procesar_estres_termico(archivo):
+    """Procesa archivo de estrés térmico"""
+    try:
+        df = pd.read_excel(archivo, header=0, engine='xlrd')
+        
+        parametros = {}
+        
+        # Procesar estructura de columnas múltiples
+        for i in range(0, len(df.columns), 2):
+            if i + 1 < len(df.columns):
+                # Buscar nombre del parámetro en los datos
+                nombre_parametro = None
+                for j in range(len(df)):
+                    unidad_val = df.iloc[j, i + 1]
+                    if pd.notna(unidad_val) and isinstance(unidad_val, str):
+                        nombre_parametro = str(unidad_val).strip()
+                        break
+                
+                if nombre_parametro:
+                    valores = df.iloc[1:, i].dropna()
+                    if len(valores) > 0:
+                        parametros[nombre_parametro] = [
+                            safe_min(valores),
+                            safe_mean(valores),
+                            safe_max(valores)
+                        ]
+        
+        return parametros
+        
+    except Exception as e:
+        st.error(f"Error procesando estrés térmico: {str(e)}")
+        return {}
+
+def generar_excel_consolidado(datos_aire, datos_ruido, datos_et, nombre_empresa):
+    """Genera Excel usando solo pandas"""
     output = io.BytesIO()
     
-    # Crear Excel con pandas
     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
         # Hoja Resumen Aire
         if datos_aire:
@@ -87,6 +156,13 @@ def generar_excel_consolidado(datos_aire, datos_ruido, nombre_empresa):
             df_leq, df_lcpk = crear_resumen_ruido(datos_ruido)
             df_leq.to_excel(writer, sheet_name='Resumen Ruido Leq', index=False)
             df_lcpk.to_excel(writer, sheet_name='Resumen Ruido Lcpk', index=False)
+        
+        # Hoja Resumen Estrés Térmico
+        if datos_et:
+            df_wbgt, df_otros = crear_resumen_et(datos_et)
+            df_wbgt.to_excel(writer, sheet_name='Resumen ET WBGT', index=False)
+            if not df_otros.empty:
+                df_otros.to_excel(writer, sheet_name='Resumen ET Otros', index=False)
     
     output.seek(0)
     return output.getvalue()
@@ -106,10 +182,12 @@ def crear_resumen_aire(datos_aire):
     for punto, datos in datos_aire.items():
         filas.append({
             'Punto': punto,
-            'Área': '',  # Para que complete el usuario
-            'Nombre': '', # Para que complete el usuario
+            'Área': '',
+            'Nombre': '',
+            'CO2 (ppm)': datos.get('CO2 (ppm)', [0, 0, 0])[1],
             'CO (ppm)': datos.get('CO (ppm)', [0, 0, 0])[1],
             'Polvo (µg/m3)': datos.get('Polvo (µg/m3)', [0, 0, 0])[1],
+            'COV (mg/m³)': datos.get('COV (mg/m³)', [0, 0, 0])[1],
             'Temperatura (°C)': datos.get('Temperatura (°C)', [0, 0, 0])[1],
             'Humedad Relativa (%)': datos.get('Humedad Relativa (%)', [0, 0, 0])[1]
         })
@@ -122,7 +200,6 @@ def crear_resumen_ruido(datos_ruido):
     lcpk_filas = []
     
     for punto, datos in datos_ruido.items():
-        # Datos Leq
         leq_filas.append({
             'Punto': punto,
             'Área': '',
@@ -133,7 +210,6 @@ def crear_resumen_ruido(datos_ruido):
             'Detalle': ''
         })
         
-        # Datos Lcpk
         lcpk_filas.append({
             'Punto': punto,
             'Área': '',
@@ -145,6 +221,33 @@ def crear_resumen_ruido(datos_ruido):
         })
     
     return pd.DataFrame(leq_filas), pd.DataFrame(lcpk_filas)
+
+def crear_resumen_et(datos_et):
+    """Crea DataFrames para resumen de estrés térmico"""
+    wbgt_filas = []
+    otros_filas = []
+    
+    for param_name, valores in datos_et.items():
+        if 'WBGT' in param_name.upper():
+            wbgt_filas.append({
+                'Punto': 1,
+                'Área': '',
+                'Mínimo': valores[0],
+                'Promedio': valores[1],
+                'Máximo': valores[2],
+                'Límite': 26.7,
+                'Detalle': ''
+            })
+        else:
+            otros_filas.append({
+                'Parámetro': param_name,
+                'Mínimo': valores[0],
+                'Promedio': valores[1],
+                'Máximo': valores[2],
+                'Límite': ''
+            })
+    
+    return pd.DataFrame(wbgt_filas), pd.DataFrame(otros_filas)
 
 # ===== INTERFAZ PRINCIPAL =====
 def main():
@@ -159,20 +262,23 @@ def main():
     st.sidebar.info("""
     **Instrucciones:**
     1. Sube los archivos según el tipo
-    2. Procesa los datos  
-    3. Descarga el reporte consolidado
+    2. Configura los tiempos para Airthinx
+    3. Procesa los datos  
+    4. Descarga el reporte consolidado
     """)
     
     # Pestañas
-    tab1, tab2, tab3 = st.tabs(["📁 Carga de Archivos", "⚙️ Procesar", "📊 Resultados"])
+    tab1, tab2, tab3, tab4 = st.tabs(["📁 Carga de Archivos", "⏰ Tiempos Airthinx", "⚙️ Procesar", "📊 Resultados"])
     
     with tab1:
         st.header("Carga de Archivos")
         
-        col1, col2 = st.columns(2)
+        col1, col2, col3 = st.columns(3)
         
         with col1:
-            st.subheader("🌫️ Calidad de Aire (3M)")
+            st.subheader("🌫️ Calidad de Aire")
+            st.info("Archivos 3M (.xls) y Airthinx (.xlsx)")
+            
             archivos_3m_aire = st.file_uploader(
                 "Subir archivos 3M Aire (.xls)",
                 type=['xls'],
@@ -180,65 +286,153 @@ def main():
                 key="aire_3m"
             )
             
+            archivo_airthinx = st.file_uploader(
+                "Subir archivo Airthinx (.xlsx)",
+                type=['xlsx'],
+                key="airthinx"
+            )
+            
         with col2:
             st.subheader("🔊 Niveles de Ruido")
+            st.info("Archivos 3M Ruido (.xls)")
+            
             archivos_ruido = st.file_uploader(
                 "Subir archivos Ruido 3M (.xls)",
                 type=['xls'],
                 accept_multiple_files=True,
                 key="ruido"
             )
+            
+        with col3:
+            st.subheader("🌡️ Estrés Térmico")
+            st.info("Archivo de Estrés Térmico (.xls)")
+            
+            archivo_et = st.file_uploader(
+                "Subir archivo Estrés Térmico (.xls)",
+                type=['xls'],
+                key="et"
+            )
     
     with tab2:
-        st.header("Procesar Datos")
+        st.header("Configuración de Tiempos Airthinx")
         
         if archivos_3m_aire:
-            st.success(f"✅ {len(archivos_3m_aire)} archivos de aire listos")
+            num_puntos = len(archivos_3m_aire)
+            st.info(f"Se detectaron {num_puntos} puntos de medición. Configura los tiempos para cada punto:")
+            
+            tiempos_airthinx = {}
+            for i in range(1, num_puntos + 1):
+                st.markdown(f"**Punto {i}**")
+                col1, col2 = st.columns(2)
+                with col1:
+                    inicio = st.time_input(f"Inicio", value=pd.Timestamp("09:00").time(), key=f"inicio_{i}")
+                with col2:
+                    fin = st.time_input(f"Fin", value=pd.Timestamp("17:00").time(), key=f"fin_{i}")
+                
+                tiempos_airthinx[i] = (inicio, fin)
+            
+            st.session_state.tiempos_airthinx = tiempos_airthinx
+            st.success("✅ Tiempos configurados correctamente")
+        else:
+            st.warning("⚠️ Primero carga los archivos de aire 3M en la pestaña 'Carga de Archivos'")
+    
+    with tab3:
+        st.header("Procesar Datos")
+        
+        # Mostrar estado de archivos cargados
+        if archivos_3m_aire:
+            st.success(f"✅ {len(archivos_3m_aire)} archivos de aire 3M listos")
+        
+        if archivo_airthinx:
+            st.success("✅ Archivo Airthinx listo")
         
         if archivos_ruido:
             st.success(f"✅ {len(archivos_ruido)} archivos de ruido listos")
         
+        if archivo_et:
+            st.success("✅ Archivo de estrés térmico listo")
+        
         if st.button("🚀 Procesar Todos los Datos", type="primary"):
-            # Procesar aire
+            resultados_totales = {}
+            
+            # Procesar aire 3M
             if archivos_3m_aire:
-                with st.spinner("Procesando datos de aire..."):
+                with st.spinner("Procesando datos de aire 3M..."):
                     resultados_aire = procesar_3m_aire(archivos_3m_aire)
-                    st.session_state.resultados_aire = resultados_aire
-                    st.success(f"✅ {len(resultados_aire)} puntos de aire procesados")
+                    resultados_totales['aire'] = resultados_aire
+                    st.success(f"✅ {len(resultados_aire)} puntos de aire 3M procesados")
+            
+            # Procesar Airthinx
+            if archivo_airthinx and 'tiempos_airthinx' in st.session_state:
+                with st.spinner("Procesando datos Airthinx..."):
+                    resultados_airthinx = procesar_airthinx(archivo_airthinx, st.session_state.tiempos_airthinx)
+                    
+                    # Combinar con resultados de aire 3M si existen
+                    if 'aire' in resultados_totales:
+                        for punto, datos in resultados_airthinx.items():
+                            if punto in resultados_totales['aire']:
+                                resultados_totales['aire'][punto].update(datos)
+                    else:
+                        resultados_totales['aire'] = resultados_airthinx
+                    
+                    st.success(f"✅ {len(resultados_airthinx)} puntos de Airthinx procesados")
             
             # Procesar ruido
             if archivos_ruido:
                 with st.spinner("Procesando datos de ruido..."):
                     resultados_ruido = procesar_ruido_3m(archivos_ruido)
-                    st.session_state.resultados_ruido = resultados_ruido
+                    resultados_totales['ruido'] = resultados_ruido
                     st.success(f"✅ {len(resultados_ruido)} puntos de ruido procesados")
+            
+            # Procesar estrés térmico
+            if archivo_et:
+                with st.spinner("Procesando datos de estrés térmico..."):
+                    resultados_et = procesar_estres_termico(archivo_et)
+                    resultados_totales['estres_termico'] = resultados_et
+                    st.success(f"✅ {len(resultados_et)} parámetros de estrés térmico procesados")
+            
+            st.session_state.resultados = resultados_totales
+            st.success("🎉 ¡Todos los datos han sido procesados!")
     
-    with tab3:
+    with tab4:
         st.header("Resultados y Descarga")
         
-        # Mostrar resultados de aire
-        if 'resultados_aire' in st.session_state:
-            st.subheader("📊 Resumen Aire")
-            df_aire = crear_resumen_aire(st.session_state.resultados_aire)
-            st.dataframe(df_aire)
-        
-        # Mostrar resultados de ruido
-        if 'resultados_ruido' in st.session_state:
-            st.subheader("📊 Resumen Ruido - Leq")
-            df_leq, df_lcpk = crear_resumen_ruido(st.session_state.resultados_ruido)
-            st.dataframe(df_leq)
+        if 'resultados' in st.session_state:
+            resultados = st.session_state.resultados
             
-            st.subheader("📊 Resumen Ruido - Lcpk")
-            st.dataframe(df_lcpk)
-        
-        # Botón de descarga
-        if 'resultados_aire' in st.session_state or 'resultados_ruido' in st.session_state:
+            # Mostrar resultados de aire
+            if 'aire' in resultados:
+                st.subheader("📊 Resumen Aire")
+                df_aire = crear_resumen_aire(resultados['aire'])
+                st.dataframe(df_aire)
+            
+            # Mostrar resultados de ruido
+            if 'ruido' in resultados:
+                st.subheader("📊 Resumen Ruido - Leq")
+                df_leq, df_lcpk = crear_resumen_ruido(resultados['ruido'])
+                st.dataframe(df_leq)
+                
+                st.subheader("📊 Resumen Ruido - Lcpk")
+                st.dataframe(df_lcpk)
+            
+            # Mostrar resultados de estrés térmico
+            if 'estres_termico' in resultados:
+                st.subheader("📊 Resumen Estrés Térmico - WBGT")
+                df_wbgt, df_otros = crear_resumen_et(resultados['estres_termico'])
+                st.dataframe(df_wbgt)
+                
+                if not df_otros.empty:
+                    st.subheader("📊 Resumen Estrés Térmico - Otros Parámetros")
+                    st.dataframe(df_otros)
+            
+            # Botón de descarga
             st.markdown("---")
             if st.button("📥 Generar Excel Consolidado", type="primary"):
                 with st.spinner("Generando reporte Excel..."):
                     excel_buffer = generar_excel_consolidado(
-                        st.session_state.get('resultados_aire'),
-                        st.session_state.get('resultados_ruido'),
+                        resultados.get('aire'),
+                        resultados.get('ruido'),
+                        resultados.get('estres_termico'),
                         nombre_empresa
                     )
                     
@@ -250,6 +444,8 @@ def main():
                     )
                     
                     st.success("✅ Reporte generado correctamente")
+        else:
+            st.info("👆 Primero procesa los datos en la pestaña 'Procesar'")
 
 if __name__ == "__main__":
     main()
